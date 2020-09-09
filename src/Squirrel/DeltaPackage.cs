@@ -29,6 +29,8 @@ namespace Squirrel
 
     public class DeltaPackageBuilder : IEnableLogger, IDeltaPackageBuilder
     {
+        private const string diffFileRegex = @"\.(bs|vc)?diff$";
+
         readonly string localAppDirectory;
         public DeltaPackageBuilder(string localAppDataOverride = null)
         {
@@ -137,9 +139,10 @@ namespace Squirrel
                     .Where(x => x.StartsWith("lib", StringComparison.InvariantCultureIgnoreCase))
                     .Where(x => !x.EndsWith(".shasum", StringComparison.InvariantCultureIgnoreCase))
                     .Where(x => !x.EndsWith(".diff", StringComparison.InvariantCultureIgnoreCase) ||
-                                !deltaPathRelativePaths.Contains(x.Replace(".diff", ".bsdiff")))
+                                !deltaPathRelativePaths.Contains(x.Replace(".diff", ".bsdiff")) ||
+                                !deltaPathRelativePaths.Contains(x.Replace(".diff", ".vcdiff")))
                     .ForEach(file => {
-                        pathsVisited.Add(Regex.Replace(file, @"\.(bs)?diff$", "").ToLowerInvariant());
+                        pathsVisited.Add(Regex.Replace(file, diffFileRegex, "").ToLowerInvariant());
                         applyDiffToFile(deltaPath, file, workingPath);
                     });
 
@@ -292,7 +295,7 @@ namespace Squirrel
         void applyDiffToFile(string deltaPath, string relativeFilePath, string workingDirectory)
         {
             var inputFile = Path.Combine(deltaPath, relativeFilePath);
-            var finalTarget = Path.Combine(workingDirectory, Regex.Replace(relativeFilePath, @"\.(bs)?diff$", ""));
+            var finalTarget = Path.Combine(workingDirectory, Regex.Replace(relativeFilePath, diffFileRegex, ""));
 
             var tempTargetFile = default(string);
             Utility.WithTempFile(out tempTargetFile, localAppDirectory);
@@ -304,23 +307,61 @@ namespace Squirrel
                     return;
                 }
 
-                 if (relativeFilePath.EndsWith(".bsdiff", StringComparison.InvariantCultureIgnoreCase)) {
+                if (relativeFilePath.EndsWith(".bsdiff", StringComparison.InvariantCultureIgnoreCase))
+                {
                     using (var of = File.OpenWrite(tempTargetFile))
-                    using (var inf = File.OpenRead(finalTarget)) {
+                    using (var inf = File.OpenRead(finalTarget))
+                    {
                         this.Log().Info("Applying BSDiff to {0}", relativeFilePath);
                         BinaryPatchUtility.Apply(inf, () => File.OpenRead(inputFile), of);
                     }
 
                     verifyPatchedFile(relativeFilePath, inputFile, tempTargetFile);
-                 } else if (relativeFilePath.EndsWith(".diff", StringComparison.InvariantCultureIgnoreCase)) {
+                }
+                else if (relativeFilePath.EndsWith(".vcdiff", StringComparison.InvariantCultureIgnoreCase))
+                {
+                    using (FileStream output = File.OpenWrite(tempTargetFile))
+                    using (FileStream dict = File.OpenRead(finalTarget))
+                    using (FileStream target = File.OpenRead(inputFile))
+                    {
+                        this.Log().Info("Applying VCDiff to {0}", relativeFilePath);
+                        VCDecoder decoder = new VCDecoder(dict, target, output);
+
+                        //You must call decoder.Start() first. The header of the delta file must be available before calling decoder.Start()
+
+                        VCDiffResult result = decoder.Start();
+
+                        if (result != VCDiffResult.SUCCESS)
+                        {
+                            //error abort
+                            throw new Exception($"VCDiff {result == VCDiffResult.ERRROR}");
+                        }
+                        long bytesWritten = 0;
+                        result = decoder.Decode(out bytesWritten);
+
+                        if (result != VCDiffResult.SUCCESS)
+                        {
+                            //error decoding
+                            throw new Exception($"VCDiff {result == VCDiffResult.ERRROR}");
+                        }
+                        //if success bytesWritten will contain the number of bytes that were decoded
+                    }
+
+                    verifyPatchedFile(relativeFilePath, inputFile, tempTargetFile);
+                }
+                else if (relativeFilePath.EndsWith(".diff", StringComparison.InvariantCultureIgnoreCase))
+                {
                     this.Log().Info("Applying MSDiff to {0}", relativeFilePath);
                     var msDelta = new MsDeltaCompression();
                     msDelta.ApplyDelta(inputFile, finalTarget, tempTargetFile);
 
                     verifyPatchedFile(relativeFilePath, inputFile, tempTargetFile);
-                } else {
+                }
+                else
+                {
                     using (var of = File.OpenWrite(tempTargetFile))
-                    using (var inf = File.OpenRead(inputFile)) {
+                    using (var inf = File.OpenRead(inputFile))
+                    {
                         this.Log().Info("Adding new file: {0}", relativeFilePath);
                         inf.CopyTo(of);
                     }
@@ -339,7 +380,7 @@ namespace Squirrel
 
         void verifyPatchedFile(string relativeFilePath, string inputFile, string tempTargetFile)
         {
-            var shaFile = Regex.Replace(inputFile, @"\.(bs)?diff$", ".shasum");
+            var shaFile = Regex.Replace(inputFile, diffFileRegex, ".shasum");
             var expectedReleaseEntry = ReleaseEntry.ParseReleaseEntry(File.ReadAllText(shaFile, Encoding.UTF8));
             var actualReleaseEntry = ReleaseEntry.GenerateFromFile(tempTargetFile);
 
